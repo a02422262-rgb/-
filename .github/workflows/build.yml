@@ -1,12 +1,37 @@
-
 name: Build Air Frontier
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия (семвер, например 35.0.0)"
+        default: "35.0.0"
+        required: true
+        type: string
+      windows:
+        description: "Собрать Windows (.exe)"
+        default: true
+        type: boolean
+      android:
+        description: "Собрать Android (.apk)"
+        default: true
+        type: boolean
+      ios:
+        description: "Собрать iOS (.ipa без подписи, дорого по минутам)"
+        default: false
+        type: boolean
+      release:
+        description: "Создать GitHub Release со сборками"
+        default: true
+        type: boolean
 
+# Права по минимуму; запись нужна только джобе release
 permissions:
-  contents: write
-  actions: read
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
 
@@ -14,48 +39,82 @@ jobs:
   # WINDOWS EXE
   # =========================
   windows:
+    if: ${{ inputs.windows }}
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract project
+      # Берёт .zip из корня репозитория (или сам репозиторий, если распакован)
+      # и сам находит папку с package.json, даже если в архиве есть вложенная папка
+      - name: Распаковать проект
         shell: pwsh
         run: |
-          $zip = Get-ChildItem -Filter *.zip | Select-Object -First 1
-          Expand-Archive -Path $zip.FullName -DestinationPath app
+          $zip = Get-ChildItem -Path . -Filter *.zip | Select-Object -First 1
+          if ($zip) { Expand-Archive -Path $zip.FullName -DestinationPath app -Force; $root = 'app' } else { $root = '.' }
+          if (Test-Path "$root/package.json") { $dir = (Resolve-Path $root).Path }
+          else {
+            $pkg = Get-ChildItem -Path $root -Recurse -Depth 3 -Filter package.json |
+              Where-Object { $_.FullName -notmatch 'node_modules|__MACOSX' } | Select-Object -First 1
+            if (-not $pkg) { Write-Error "package.json не найден: положите .zip проекта в корень репозитория"; exit 1 }
+            $dir = $pkg.DirectoryName
+          }
+          "APP_DIR=$($dir -replace '\\','/')" >> $env:GITHUB_ENV
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies
-        working-directory: app
-        run: npm install
+      - name: Установить зависимости
+        working-directory: ${{ env.APP_DIR }}
+        run: npm install --no-audit --no-fund
 
-      - name: Build EXE
-        working-directory: app
-        run: npm run dist:win
+      - name: Собрать EXE
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          VERSION: ${{ inputs.version }}
+        run: npm run dist:win -- --publish never "-c.extraMetadata.version=$env:VERSION"
+
+      # Имена с кириллицей ломают загрузку в Release, переименовываем в ASCII
+      - name: Переименовать файлы
+        working-directory: ${{ env.APP_DIR }}
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -Filter *.exe | ForEach-Object {
+            $n = if ($_.Name -match 'Setup') { 'AirFrontier-Setup.exe' } else { 'AirFrontier-Portable.exe' }
+            Move-Item -LiteralPath $_.FullName -Destination (Join-Path dist $n) -Force
+          }
+          Get-ChildItem dist -Filter *.exe | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: app/dist/*.exe
+          path: ${{ env.APP_DIR }}/dist/AirFrontier-*.exe
           if-no-files-found: error
+          retention-days: 3
 
 
   # =========================
   # ANDROID APK
   # =========================
   android:
+    if: ${{ inputs.android }}
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract project
+      - name: Распаковать проект
         run: |
-          unzip -q "$(find . -maxdepth 1 -name '*.zip' | head -n 1)" -d app
+          zip=$(find . -maxdepth 1 -name '*.zip' | head -n 1)
+          if [ -n "$zip" ]; then unzip -q "$zip" -d app; root=app; else root=.; fi
+          if [ -f "$root/package.json" ]; then dir="$root"
+          else dir=$(dirname "$(find "$root" -maxdepth 4 -name package.json -not -path '*/node_modules/*' -not -path '*/__MACOSX/*' | head -n 1)"); fi
+          [ -f "$dir/package.json" ] || { echo "::error::package.json не найден: положите .zip проекта в корень репозитория"; exit 1; }
+          echo "APP_DIR=$(cd "$dir" && pwd)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:
@@ -66,106 +125,162 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Install dependencies
-        working-directory: app
-        run: npm install
+      - uses: gradle/actions/setup-gradle@v4
 
-      - name: Configure Android
-        working-directory: app
+      - name: Установить зависимости
+        working-directory: ${{ env.APP_DIR }}
+        run: npm install --no-audit --no-fund
+
+      # cap add уже делает sync, второй раз sync не нужен.
+      # Название приложения берётся из appName в capacitor.config.json
+      - name: Создать Android-проект
+        working-directory: ${{ env.APP_DIR }}
+        run: npx cap add android
+
+      # Иконки из icon-1024.png (если не получится — собираем со стандартной)
+      - name: Сгенерировать иконки
+        working-directory: ${{ env.APP_DIR }}
+        continue-on-error: true
         run: |
-          npx cap add android
-          npx cap sync android
+          mkdir -p assets
+          cp icon-1024.png assets/icon.png
+          npx --yes @capacitor/assets@3 generate --android --iconBackgroundColor '#0e1113' --iconBackgroundColorDark '#0e1113'
 
-      - name: Configure application
-        working-directory: app
+      - name: Настроить приложение
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
-          sed -i 's/android:label="[^"]*"/android:label="Воздушный рубеж"/' android/app/src/main/AndroidManifest.xml
-          sed -i 's/<activity/<activity android:screenOrientation="sensorLandscape"/' android/app/src/main/AndroidManifest.xml
+          M=android/app/src/main/AndroidManifest.xml
+          G=android/app/build.gradle
+          # горизонтальная ориентация только для главной activity
+          sed -i '0,/<activity/s//<activity android:screenOrientation="sensorLandscape"/' "$M"
+          # versionCode растёт с каждой сборкой
+          sed -i "s/versionCode 1/versionCode $BUILD_NUMBER/; s/versionName \"1.0\"/versionName \"$VERSION\"/" "$G"
+          grep -q sensorLandscape "$M" || { echo "::error::Не удалось задать ориентацию"; exit 1; }
+          grep -n 'versionCode\|versionName' "$G"
 
-      - name: Build APK
-        working-directory: app/android
+      - name: Собрать APK
+        working-directory: ${{ env.APP_DIR }}/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Переименовать APK
+        working-directory: ${{ env.APP_DIR }}/android/app/build/outputs/apk/debug
+        run: mv ./*.apk AirFrontier.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: android
-          path: app/android/app/build/outputs/apk/debug/*.apk
+          path: ${{ env.APP_DIR }}/android/app/build/outputs/apk/debug/AirFrontier.apk
           if-no-files-found: error
+          retention-days: 3
 
 
   # =========================
-  # IOS IPA
+  # IOS IPA (без подписи — ставится через AltStore / Sideloadly)
   # =========================
   ios:
+    if: ${{ inputs.ios }}
     runs-on: macos-latest
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract project
+      - name: Распаковать проект
         run: |
-          unzip -q "$(find . -maxdepth 1 -name '*.zip' | head -n 1)" -d app
+          zip=$(find . -maxdepth 1 -name '*.zip' | head -n 1)
+          if [ -n "$zip" ]; then unzip -q "$zip" -d app; root=app; else root=.; fi
+          if [ -f "$root/package.json" ]; then dir="$root"
+          else dir=$(dirname "$(find "$root" -maxdepth 4 -name package.json -not -path '*/node_modules/*' -not -path '*/__MACOSX/*' | head -n 1)"); fi
+          [ -f "$dir/package.json" ] || { echo "::error::package.json не найден: положите .zip проекта в корень репозитория"; exit 1; }
+          echo "APP_DIR=$(cd "$dir" && pwd)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies
-        working-directory: app
-        run: npm install
-
-      - name: Add iOS
-        working-directory: app
+      - name: Установить зависимости
+        working-directory: ${{ env.APP_DIR }}
         run: |
-          npx cap add ios
-          npx cap sync ios
+          npm install --no-audit --no-fund
+          # в package.json нет @capacitor/ios, без него cap add ios падает
+          npm install --no-save --no-audit --no-fund @capacitor/ios@^6.0.0
 
-      - name: Build iOS
-        working-directory: app
+      # Capacitor 6 использует CocoaPods: cap add сам делает pod install
+      - name: Создать iOS-проект
+        working-directory: ${{ env.APP_DIR }}
+        run: npx cap add ios
+
+      - name: Горизонтальная ориентация
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          P=ios/App/App/Info.plist
+          for K in UISupportedInterfaceOrientations 'UISupportedInterfaceOrientations~ipad'; do
+            /usr/libexec/PlistBuddy -c "Delete :$K" "$P" || true
+            /usr/libexec/PlistBuddy -c "Add :$K array" "$P"
+            /usr/libexec/PlistBuddy -c "Add :$K:0 string UIInterfaceOrientationLandscapeLeft" "$P"
+            /usr/libexec/PlistBuddy -c "Add :$K:1 string UIInterfaceOrientationLandscapeRight" "$P"
+          done
+
+      # Нужен именно workspace (а не project), иначе не подключатся pods
+      - name: Собрать iOS
+        working-directory: ${{ env.APP_DIR }}
         run: |
           xcodebuild \
-            -project ios/App/App.xcodeproj \
+            -workspace ios/App/App.xcworkspace \
             -scheme App \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             build
 
-      - name: Package IPA
-        working-directory: app
+      - name: Упаковать IPA
+        working-directory: ${{ env.APP_DIR }}
         run: |
-          mkdir -p Payload
+          rm -rf Payload && mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/App.app Payload/
-          zip -r AirFrontier.ipa Payload
+          zip -qry AirFrontier.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
           name: ios
-          path: app/AirFrontier.ipa
+          path: ${{ env.APP_DIR }}/AirFrontier.ipa
           if-no-files-found: error
+          retention-days: 3
 
 
   # =========================
-  # CREATE RELEASE
+  # RELEASE
   # =========================
   release:
     needs: [windows, android, ios]
+    # Запускается, если что-то собралось и ничего не упало (пропущенные платформы не мешают)
+    if: ${{ !cancelled() && inputs.release && !contains(needs.*.result, 'failure') && contains(needs.*.result, 'success') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
 
     steps:
-      - name: Download all builds
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: release
 
-      - name: Publish applications
-        uses: softprops/action-gh-release@v2
+      - name: Показать файлы
+        run: ls -lhR release
+
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Air Frontier Build ${{ github.run_number }}
+          tag_name: v${{ inputs.version }}-b${{ github.run_number }}
+          name: Воздушный рубеж ${{ inputs.version }} (сборка ${{ github.run_number }})
           files: |
             release/windows/*.exe
             release/android/*.apk
